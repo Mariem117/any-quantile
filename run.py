@@ -1,19 +1,24 @@
 import argparse
 import yaml
+import numpy as np
+import pytorch_lightning as pl
+import torch
 from omegaconf import OmegaConf
 from sklearn.model_selection import ParameterGrid
-
-import os
-import random
-import logging
-import torch
-
-import pytorch_lightning as pl
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 
 from utils.checkpointing import get_checkpoint_path
 from utils.model_factory import instantiate
+
+
+from utils.checkpointing import get_checkpoint_path
+from utils.model_factory import instantiate
+
+
+# NumPy 2.0 compatibility: restore np.string_ alias
+if not hasattr(np, "string_"):
+    np.string_ = np.bytes_
 
 
 def run(cfg_yaml):
@@ -51,6 +56,7 @@ def main(config_path: str, overrides: list = []):
     
     if not torch.cuda.is_available():
         print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+        print("!!! CUDA is NOT available !!!")
         print("!!! CUDA is NOT available !!!")
         print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
         

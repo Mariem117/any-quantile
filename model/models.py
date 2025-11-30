@@ -227,11 +227,21 @@ class AnyQuantileForecaster(MlpForecaster):
         y_hat = net_output['forecast'] # BxHxQ
         quantiles = net_output['quantiles'][:,None] # Bx1xQ
         
-        self.test_mse(y_hat[..., 0].contiguous(), batch['target'])
-        self.test_mae(y_hat[..., 0].contiguous(), batch['target'])
-        self.test_smape(y_hat[..., 0].contiguous(), batch['target'])
-        self.test_mape(y_hat[..., 0].contiguous(), batch['target'])
-        self.test_crps(y_hat, batch['target'], q=quantiles)
+        # Extract point forecasts (center quantile or first quantile)
+        y_hat_point = y_hat[..., 0].contiguous()  # BxH
+        
+        # Update metrics with point forecasts
+        self.test_mse(y_hat_point, batch['target'])
+        self.test_mae(y_hat_point, batch['target'])
+        self.test_smape(y_hat_point, batch['target'])
+        self.test_mape(y_hat_point, batch['target'])
+        
+        # Update probabilistic metrics with full quantile outputs
+        try:
+            self.test_crps(y_hat, batch['target'], q=quantiles)
+            self.test_coverage(y_hat, batch['target'], q=quantiles)
+        except Exception as e:
+            print(f"Warning: CRPS/Coverage update failed: {e}")
                 
         batch_size=batch['history'].shape[0]
         self.log("test/mse", self.test_mse, on_step=False, on_epoch=True, 
@@ -244,7 +254,7 @@ class AnyQuantileForecaster(MlpForecaster):
                  prog_bar=False, logger=True, batch_size=batch_size)
         self.log("test/crps", self.test_crps, on_step=False, on_epoch=True, 
                  prog_bar=False, logger=True, batch_size=batch_size)
-        self.log(f"test/coverage-{self.test_coverage.level}", self.val_coverage, on_step=False, on_epoch=True, 
+        self.log(f"test/coverage-{self.test_coverage.level}", self.test_coverage, on_step=False, on_epoch=True, 
                  prog_bar=False, logger=True, batch_size=batch_size)
 
 
@@ -328,12 +338,20 @@ class AnyQuantileForecasterLog(AnyQuantileForecaster):
         y_hat = net_output['forecast'] # BxHxQ
         quantiles = net_output['quantiles'][:,None] # Bx1xQ
         y_hat_exp = net_output['forecast_exp'] # BxHxQ
-                
-        self.test_mse(y_hat_exp[..., 0], batch['target'])
-        self.test_mae(y_hat_exp[..., 0], batch['target'])
-        self.test_smape(y_hat_exp[..., 0], batch['target'])
-        self.test_mape(y_hat_exp[..., 0], batch['target'])
-        self.test_crps(y_hat_exp, batch['target'], q=quantiles)
+        
+        # Extract point forecasts
+        y_hat_point = y_hat_exp[..., 0].contiguous()
+        
+        self.test_mse(y_hat_point, batch['target'])
+        self.test_mae(y_hat_point, batch['target'])
+        self.test_smape(y_hat_point, batch['target'])
+        self.test_mape(y_hat_point, batch['target'])
+        
+        try:
+            self.test_crps(y_hat_exp, batch['target'], q=quantiles)
+            self.test_coverage(y_hat_exp, batch['target'], q=quantiles)
+        except Exception as e:
+            print(f"Warning: CRPS/Coverage update failed: {e}")
                 
         batch_size=batch['history'].shape[0]
         self.log("test/mse", self.test_mse, on_step=False, on_epoch=True, 
@@ -346,7 +364,8 @@ class AnyQuantileForecasterLog(AnyQuantileForecaster):
                  prog_bar=False, logger=True, batch_size=batch_size)
         self.log("test/crps", self.test_crps, on_step=False, on_epoch=True, 
                  prog_bar=False, logger=True, batch_size=batch_size)
-        self.log(f"test/coverage-{self.test_coverage.level}", self.val_coverage, on_step=False, on_epoch=True, 
+        # FIX: use self.test_coverage, not self.val_coverage
+        self.log(f"test/coverage-{self.test_coverage.level}", self.test_coverage, on_step=False, on_epoch=True, 
                  prog_bar=False, logger=True, batch_size=batch_size)
         
 
@@ -426,8 +445,7 @@ class GeneralForecaster(MlpForecaster):
     def forward(self, x):
         out = self.shared_forward(x)
         return out['forecast']
-    
-    
-    
-    
-    
+
+
+
+

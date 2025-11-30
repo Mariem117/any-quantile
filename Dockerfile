@@ -1,13 +1,13 @@
-FROM pytorch/pytorch:2.3.1-cuda11.8-cudnn8-runtime as pytorch
+FROM pytorch/pytorch:2.3.1-cuda11.8-cudnn8-runtime AS pytorch
 
-ENV PROJECT_PATH /workspace/any-quantile
+ENV PROJECT_PATH=/workspace/any-quantile \
+    LANG=en_US.UTF-8 \
+    LANGUAGE=en_US:en \
+    LC_ALL=en_US.UTF-8 \
+    PYTHONIOENCODING=utf-8
 
 RUN date
 RUN apt-get update && apt-get install -y locales && locale-gen en_US.UTF-8 && apt-get -y install git g++ zip unzip gnupg wget
-ENV LANG en_US.UTF-8
-ENV LANGUAGE en_US:en
-ENV LC_ALL en_US.UTF-8
-ENV PYTHONIOENCODING=utf-8
 
 RUN python -m pip install pip -U
 

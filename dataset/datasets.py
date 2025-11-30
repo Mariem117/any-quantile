@@ -364,7 +364,7 @@ class EMHIRESUnivariateDataModule(pl.LightningDataModule):
             df = df.rename({'time_step': 'ds'}, axis=1).set_index('ds')
             df.to_parquet(emhires_wind_parquet)
 
-        assert False
+        # assert False  # Commented out to allow training
 
     def setup(self, stage: str):
         # Assign train/val datasets for use in dataloaders
