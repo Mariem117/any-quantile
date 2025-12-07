@@ -33,23 +33,6 @@ def temp_seed(seed):
     finally:
         np.random.set_state(state)
 
-
-def collate_fn_flat_deal(batch):
-    out = {}
-    for b in batch:
-        for k, bv in b.items():
-            v = out.get(k, [])
-            v.append(bv)
-            out[k] = v
-            
-    for k,v in out.items():
-        v = np.concatenate(v)
-        if type(v[0]) not in [np.str_, pd.Timestamp]:
-            v = torch.as_tensor(v)
-        out[k] = v
-    return out
-
-
 class ElectricityUnivariateDataset(Dataset):
     def __init__(self, 
                  name: str, 
@@ -71,6 +54,21 @@ class ElectricityUnivariateDataset(Dataset):
         self.fillna = fillna
         self.step = step
         
+        # Default split values if not provided
+        if self.split_end is None:
+            if split == 'train':
+                self.split_end = 0.8
+                self.split_start = 0.0
+            elif split == 'val':
+                self.split_end = 0.9
+                self.split_start = 0.8
+            elif split == 'test':
+                self.split_end = 1.0
+                self.split_start = 0.9
+            else:
+                self.split_end = 0.8
+                self.split_start = 0.0
+        
         path = os.path.join('./data/electricity/datasets', name.lower(), 'M/df_y.csv')
         df = pd.read_csv(path)
         df.ds = pd.to_datetime(df.ds)
@@ -78,22 +76,22 @@ class ElectricityUnivariateDataset(Dataset):
         cols = {int(c.split('Var')[-1]): c for c in df.columns}
         df = df[[cols[k+1] for k in range(len(cols))]]
         
-        if isinstance(split_end, pd.Timestamp) or isinstance(split_end, str):
+        if isinstance(self.split_end, pd.Timestamp) or isinstance(self.split_end, str):
             if df.index.max() < pd.to_datetime(self.split_start):
                 raise Exception(f'Start date must fall before dataset end')
             start = np.argmax(df.index >= self.split_start)
             start = max(start - self.history_length, 0)
             end = np.sum(df.index < self.split_end)
-        elif isinstance(split_end, float):
-            if split_end <= 0 or split_end > 1.0:
-                raise Exception(f'Float split_end must be in (0, 1]. Unacceptable value {split_end} found')
-            if split_start >= split_end:
+        elif isinstance(self.split_end, float):
+            if self.split_end <= 0 or self.split_end > 1.0:
+                raise Exception(f'Float split_end must be in (0, 1]. Unacceptable value {self.split_end} found')
+            if self.split_start >= self.split_end:
                 raise Exception(f'split_end must be greater than split_start. \
-                                  Unacceptable values {split_start} >= {split_end} found')
-            start = max(int(split_start * len(df)) - self.history_length, 0)
-            end = int(split_end * len(df))
+                                  Unacceptable values {self.split_start} >= {self.split_end} found')
+            start = max(int(self.split_start * len(df)) - self.history_length, 0)
+            end = int(self.split_end * len(df))
         else:
-            raise Exception(f'Unimplemented split end option {split_end.__class__}')
+            raise Exception(f'Unimplemented split end option {self.split_end.__class__}')
         
         df = df[start:end]
         self.df = df.astype(np.float32)
@@ -102,7 +100,12 @@ class ElectricityUnivariateDataset(Dataset):
         
         if self.fillna is not None:
             if isinstance(self.fillna, str):
-                self.df.fillna(method=self.fillna, inplace=True)
+                if self.fillna == 'ffill':
+                    self.df = self.df.ffill()
+                elif self.fillna == 'bfill':
+                    self.df = self.df.bfill()
+                else:
+                    raise NotImplementedError(f"Fill NaN method {self.fillna} is not implemented")
             elif np.isreal(self.fillna):
                 self.df.fillna(value=self.fillna, inplace=True)
             else:
@@ -159,6 +162,177 @@ class ElectricityUnivariateDataset(Dataset):
     def __len__(self):
         return self.cum_num_windows[-1]
     
+    def prepare_data(self):
+        """PyTorch Lightning data preparation method"""
+        pass
+    
+    def setup(self, stage=None):
+        """PyTorch Lightning setup method"""
+        pass
+    
+class ElectricityWithExogDataModule(pl.LightningDataModule):
+    def __init__(self, 
+                 name: str = 'MHLV', 
+                 train_batch_size: int = 128, 
+                 eval_batch_size: int = None,
+                 num_workers: int = 4,
+                 persistent_workers: bool = True,
+                 horizon_length: int = 720,
+                 history_length: int = 720,
+                 split_boundaries: List[str] = None,
+                 fillna: str = None,
+                 train_step: int = 1,
+                 eval_step: int = 1,
+                 exog_features: List[str] = None,
+                 calendar_features: bool = True):
+        super().__init__()
+        self.name = name
+        self.train_batch_size = train_batch_size
+        self.eval_batch_size = eval_batch_size if eval_batch_size is not None else train_batch_size
+        self.num_workers = num_workers
+        self.persistent_workers = persistent_workers
+        self.history_length = history_length
+        self.horizon_length = horizon_length
+        self.train_step = train_step
+        self.eval_step = eval_step
+        self.exog_features = exog_features
+        self.calendar_features = calendar_features
+        self.split_boundaries = split_boundaries
+        self.fillna = fillna
+    
+    def setup(self, stage: str):
+        # Assign train/val datasets for use in dataloaders
+        if stage == "fit":
+            self.train_dataset = ElectricityWithExogDataset(
+                name=self.name, split='train', 
+                split_start=self.split_boundaries[0],
+                split_end=self.split_boundaries[1],
+                horizon_length=self.horizon_length,
+                history_length=self.history_length,
+                fillna=self.fillna,
+                step=self.train_step,
+                exog_features=self.exog_features,
+                calendar_features=self.calendar_features
+            )
+            self.val_dataset = ElectricityWithExogDataset(
+                name=self.name, split='val', 
+                split_start=self.split_boundaries[1],
+                split_end=self.split_boundaries[2],
+                horizon_length=self.horizon_length,
+                history_length=self.history_length,
+                fillna=self.fillna,
+                step=self.eval_step,
+                exog_features=self.exog_features,
+                calendar_features=self.calendar_features
+            )
+        
+        if stage == "test":
+            self.test_dataset = ElectricityWithExogDataset(
+                name=self.name, split='test', 
+                split_start=self.split_boundaries[2],
+                split_end=self.split_boundaries[3],
+                horizon_length=self.horizon_length,
+                history_length=self.history_length,
+                fillna=self.fillna,
+                step=self.eval_step,
+                exog_features=self.exog_features,
+                calendar_features=self.calendar_features
+            )
+
+    def train_dataloader(self):
+        return DataLoader(self.train_dataset, batch_size=self.train_batch_size, 
+                          shuffle=True, pin_memory=True, 
+                          persistent_workers=self.persistent_workers,
+                          num_workers=self.num_workers, collate_fn=collate_fn_flat_deal)
+
+    def val_dataloader(self):
+        return DataLoader(self.val_dataset, batch_size=self.eval_batch_size, 
+                          shuffle=False, pin_memory=True, 
+                          persistent_workers=self.persistent_workers,
+                          num_workers=self.num_workers, collate_fn=collate_fn_flat_deal)
+
+    def test_dataloader(self):
+        return DataLoader(self.test_dataset, batch_size=self.eval_batch_size,
+                          shuffle=False, pin_memory=True, 
+                          persistent_workers=self.persistent_workers,
+                          num_workers=self.num_workers, collate_fn=collate_fn_flat_deal)
+    
+class ElectricityWithExogDataset(ElectricityUnivariateDataset):
+    """Extended dataset with exogenous features support"""
+    def __init__(self,
+                 name: str,
+                 split: str,
+                 exog_features: List[str] = None,
+                 calendar_features: bool = True,
+                 **kwargs):
+        super().__init__(name, split, **kwargs)
+        self.exog_features = exog_features if exog_features is not None else ['temperature', 'humidity']
+        self.calendar_features = calendar_features
+        
+        # Load exogenous data (aligned with time series)
+        if self.exog_features:
+            exog_path = f'./data/exogenous/{name.lower()}_weather.csv'
+            if os.path.exists(exog_path):
+                self.exog_df = pd.read_csv(exog_path, parse_dates=['ds'])
+                self.exog_df = self.exog_df.set_index('ds')
+            else:
+                logger.warning(f"Exogenous data not found at {exog_path}. Disabling exogenous features.")
+                self.exog_features = None
+                self.exog_df = None
+    
+    def _get_calendar_features(self, timestamps):
+        hour = timestamps.dt.hour.values / 23.0  # Normalize to [0, 1] properly
+        dow = timestamps.dt.dayofweek.values / 6.0  # 0-6 days, normalize to [0, 1]
+        month = (timestamps.dt.month.values - 1) / 11.0  # 1-12 -> 0-11, normalize to [0, 1]
+        is_weekend = (timestamps.dt.dayofweek.values >= 5).astype(float)  # Already 0 or 1
+        return np.stack([hour, dow, month, is_weekend], axis=-1)
+        
+    def __getitem__(self, index):
+        # Get base item from parent class
+        item = super().__getitem__(index)
+        
+        # Calculate window position (same logic as parent class)
+        column_idx = bisect.bisect_right(self.cum_num_windows, index)
+        window_idx = self.num_nulls[column_idx] + self.step * index - (
+            self.step * self.cum_num_windows[column_idx-1] if column_idx > 0 else 0
+        )
+        
+        # Get timestamps for this window
+        window_times = self.series_timestamps.iloc[window_idx:window_idx + self.tot_window_len]
+        
+        # Add exogenous features
+        if self.exog_features and self.exog_df is not None:
+            try:
+                exog = self.exog_df.loc[window_times.values][self.exog_features].values
+                item['exog_history'] = exog[:self.history_length][None].astype(np.float32)
+                item['exog_future'] = exog[self.history_length:][None].astype(np.float32)
+            except KeyError:
+                logger.warning(f"Missing exogenous data for timestamps in window {index}")
+                # Provide zero-filled arrays as fallback
+                item['exog_history'] = np.zeros((1, self.history_length, len(self.exog_features)), dtype=np.float32)
+                item['exog_future'] = np.zeros((1, self.horizon_length, len(self.exog_features)), dtype=np.float32)
+        
+        if self.calendar_features:
+            calendar = self._get_calendar_features(window_times)
+            item['calendar_history'] = calendar[:self.history_length][None].astype(np.float32)
+            item['calendar_future'] = calendar[self.history_length:][None].astype(np.float32)
+        
+        return item
+def collate_fn_flat_deal(batch):
+    out = {}
+    for b in batch:
+        for k, bv in b.items():
+            v = out.get(k, [])
+            v.append(bv)
+            out[k] = v
+            
+    for k,v in out.items():
+        v = np.concatenate(v)
+        if type(v[0]) not in [np.str_, pd.Timestamp]:
+            v = torch.as_tensor(v)
+        out[k] = v
+    return out
+
     
 class ElectricityUnivariateDataModule(pl.LightningDataModule):
     def __init__(self, 

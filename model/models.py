@@ -227,8 +227,10 @@ class AnyQuantileForecaster(MlpForecaster):
         y_hat = net_output['forecast'] # BxHxQ
         quantiles = net_output['quantiles'][:,None] # Bx1xQ
         
-        # Extract point forecasts (center quantile or first quantile)
-        y_hat_point = y_hat[..., 0].contiguous()  # BxH
+        # Find the median quantile (0.5) for point forecasts
+        # The first quantile in the batch is 0.5 (median)
+        median_idx = 0  # Index 0 corresponds to quantile 0.5 in your data
+        y_hat_point = y_hat[..., median_idx].contiguous()  # BxH
         
         # Update metrics with point forecasts
         self.test_mse(y_hat_point, batch['target'])
@@ -237,11 +239,8 @@ class AnyQuantileForecaster(MlpForecaster):
         self.test_mape(y_hat_point, batch['target'])
         
         # Update probabilistic metrics with full quantile outputs
-        try:
-            self.test_crps(y_hat, batch['target'], q=quantiles)
-            self.test_coverage(y_hat, batch['target'], q=quantiles)
-        except Exception as e:
-            print(f"Warning: CRPS/Coverage update failed: {e}")
+        self.test_crps(y_hat, batch['target'], q=quantiles)
+        self.test_coverage(y_hat, batch['target'], q=quantiles)
                 
         batch_size=batch['history'].shape[0]
         self.log("test/mse", self.test_mse, on_step=False, on_epoch=True, 
@@ -339,19 +338,16 @@ class AnyQuantileForecasterLog(AnyQuantileForecaster):
         quantiles = net_output['quantiles'][:,None] # Bx1xQ
         y_hat_exp = net_output['forecast_exp'] # BxHxQ
         
-        # Extract point forecasts
-        y_hat_point = y_hat_exp[..., 0].contiguous()
+        # Extract median point forecasts (index 0 = quantile 0.5)
+        median_idx = 0
+        y_hat_point = y_hat_exp[..., median_idx].contiguous()
         
         self.test_mse(y_hat_point, batch['target'])
         self.test_mae(y_hat_point, batch['target'])
         self.test_smape(y_hat_point, batch['target'])
         self.test_mape(y_hat_point, batch['target'])
-        
-        try:
-            self.test_crps(y_hat_exp, batch['target'], q=quantiles)
-            self.test_coverage(y_hat_exp, batch['target'], q=quantiles)
-        except Exception as e:
-            print(f"Warning: CRPS/Coverage update failed: {e}")
+        self.test_crps(y_hat_exp, batch['target'], q=quantiles)
+        self.test_coverage(y_hat_exp, batch['target'], q=quantiles)
                 
         batch_size=batch['history'].shape[0]
         self.log("test/mse", self.test_mse, on_step=False, on_epoch=True, 
@@ -364,10 +360,50 @@ class AnyQuantileForecasterLog(AnyQuantileForecaster):
                  prog_bar=False, logger=True, batch_size=batch_size)
         self.log("test/crps", self.test_crps, on_step=False, on_epoch=True, 
                  prog_bar=False, logger=True, batch_size=batch_size)
-        # FIX: use self.test_coverage, not self.val_coverage
         self.log(f"test/coverage-{self.test_coverage.level}", self.test_coverage, on_step=False, on_epoch=True, 
                  prog_bar=False, logger=True, batch_size=batch_size)
         
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        
+    def shared_forward(self, x):
+        history = x['history'][:, -self.cfg.model.input_horizon_len:]
+        q = x['quantiles']
+
+        x_max = torch.abs(history).max(dim=-1, keepdims=True)[0]
+        if self.cfg.model.max_norm:
+            x_max[x_max == 0] = 1
+        else:
+            x_max[x_max >= 0] = 1
+        history = history / x_max
+        
+        # Extract exogenous features
+        continuous = None
+        calendar = None
+        
+        if 'exog_history' in x:
+            continuous = x['exog_history'].squeeze(1)  # [B, T, num_continuous]
+        
+        if 'calendar_history' in x:
+            calendar = x['calendar_history'].squeeze(1)  # [B, T, 4]
+            # Convert normalized [0,1] features to integer indices
+            # Be careful with boundary conditions
+            calendar_indices = torch.stack([
+                torch.clamp((calendar[..., 0] * 24).long(), 0, 23),  # hour: 0-23
+                torch.clamp((calendar[..., 1] * 7).long(), 0, 6),    # dow: 0-6
+                torch.clamp((calendar[..., 2] * 12).long(), 0, 11),  # month: 0-11
+                calendar[..., 3].long()  # weekend: already 0 or 1
+            ], dim=-1)
+            calendar = calendar_indices
+        
+        # Pass to backbone
+        forecast = self.backbone(history, q, continuous, calendar)
+        return {'forecast': forecast * x_max[..., None], 'quantiles': q}
+
+    def forward(self, x):
+        out = self.shared_forward(x)
+        return out['forecast']
+
 
 class GeneralAnyQuantileForecaster(AnyQuantileForecaster):
     def __init__(self, cfg):
@@ -375,49 +411,6 @@ class GeneralAnyQuantileForecaster(AnyQuantileForecaster):
         
         self.time_series_projection_in = torch.nn.Linear(1, cfg.model.nn.backbone.d_model)
         self.time_series_projection_out = torch.nn.Linear(cfg.model.nn.backbone.d_model, 1)
-        self.shortcut = torch.nn.Linear(cfg.model.nn.backbone.size_in, cfg.model.nn.backbone.size_out)
-        
-        self.time_embedding = torch.nn.Embedding(self.cfg.model.nn.backbone.size_in + self.cfg.model.nn.backbone.size_out, 
-                                                 cfg.model.nn.backbone.embed_dim)
-        
-    def shared_forward(self, x):
-        history = x['history'][:, -self.cfg.model.input_horizon_len:]
-        q = x['quantiles']
-        
-        x_max = torch.abs(history).max(dim=-1, keepdims=True)[0]
-        if self.cfg.model.max_norm:
-            x_max[x_max == 0] = 1
-        else:
-            # If norm is disabled, set all values to 1
-            x_max[x_max >= 0] = 1
-        history = history / x_max
-        
-        t_h = torch.arange(self.cfg.model.input_horizon_len, dtype=torch.int64)[None].to(history.device)
-        t_f = torch.arange(self.cfg.model.nn.backbone.size_out, dtype=torch.int64)[None].to(history.device) + self.cfg.model.nn.backbone.size_in
-        
-        time_features_tgt = torch.repeat_interleave(self.time_embedding(t_f), repeats=history.shape[0], dim=0)
-        time_features_src = self.time_embedding(t_h)
-        
-        xf_input = time_features_tgt
-        xt_input = time_features_src + self.time_series_projection_in(history.unsqueeze(-1))
-        xs_input = q
-        
-        backbone_output = self.backbone(xt_input=xt_input, xf_input=xf_input, xs_input=xs_input) 
-        backbone_output = self.time_series_projection_out(backbone_output)
-        
-        forecast = backbone_output[..., 0] + history.mean(dim=-1, keepdims=True)[..., None] + self.shortcut(history)[..., None]
-        
-        return {'forecast': forecast * x_max[..., None], 'quantiles': q}
-    
-    
-    
-class GeneralForecaster(MlpForecaster):
-    def __init__(self, cfg):
-        super().__init__(cfg)
-        
-        self.time_series_projection_in = torch.nn.Linear(1, cfg.model.nn.backbone.d_model)
-        self.time_series_projection_out = torch.nn.Linear(cfg.model.nn.backbone.d_model, 1)
-        self.shortcut = torch.nn.Linear(cfg.model.nn.backbone.size_in, cfg.model.nn.backbone.size_out)
         
         # 100 includes 31 days, 12 months and 7 days of week
         self.time_embedding = torch.nn.Embedding(2000, cfg.model.nn.embedding_dim)
@@ -445,7 +438,3 @@ class GeneralForecaster(MlpForecaster):
     def forward(self, x):
         out = self.shared_forward(x)
         return out['forecast']
-
-
-
-

@@ -1,3 +1,20 @@
-from .models import MlpForecaster, GeneralForecaster, AnyQuantileForecaster, GeneralAnyQuantileForecaster, AnyQuantileForecasterLog
+from .models import (
+    MlpForecaster, 
+    AnyQuantileForecaster, 
+    AnyQuantileForecasterLog,
+    GeneralAnyQuantileForecaster
+)
 
-__all__ = ['MlpForecaster', 'GeneralForecaster', 'AnyQuantileForecaster', 'GeneralAnyQuantileForecaster', 'AnyQuantileForecasterLog']
+# Import the exogenous version separately
+try:
+    from .models_exog import AnyQuantileForecasterExog
+except ImportError:
+    pass
+
+__all__ = [
+    'MlpForecaster',
+    'AnyQuantileForecaster', 
+    'AnyQuantileForecasterLog',
+    'GeneralAnyQuantileForecaster',
+    'AnyQuantileForecasterExog'
+]

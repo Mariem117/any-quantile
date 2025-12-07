@@ -75,6 +75,7 @@ class CRPS(Metric):
 
         self.add_state("numerator", default=torch.FloatTensor([0.0]), dist_reduce_fx="sum")
         self.add_state("denominator", default=torch.FloatTensor([0.0]), dist_reduce_fx="sum")
+        self.add_state("update_count", default=torch.tensor(0), dist_reduce_fx="sum")
         self.horizon = horizon
         self.mqloss = MQLoss()
 
@@ -106,6 +107,7 @@ class CRPS(Metric):
                     
                 self.numerator += loss_val * torch.numel(preds)
                 self.denominator += torch.numel(preds)
+                self.update_count += 1
             else:
                 # Convert horizon to integer if it's a tensor or ensure it's a valid index
                 if isinstance(self.horizon, torch.Tensor):
@@ -123,6 +125,7 @@ class CRPS(Metric):
                         return
                     self.numerator += loss_val * torch.numel(preds)
                     self.denominator += torch.numel(preds)
+                    self.update_count += 1
                 else:
                     # Handle q tensor indexing - it might be Bx1xQ or BxHxQ
                     if q.shape[1] == 1:
@@ -144,6 +147,7 @@ class CRPS(Metric):
                     
                     self.numerator += loss_val * torch.numel(preds[:, horizon_idx, :])
                     self.denominator += torch.numel(preds[:, horizon_idx, :])
+                    self.update_count += 1
                     
         except Exception as e:
             # More informative error logging
@@ -152,13 +156,14 @@ class CRPS(Metric):
             traceback.print_exc()
 
     def compute(self):
-        if self.denominator > 0:
+        if self.denominator > 0 and self.update_count > 0:
             result = 2 * (self.numerator / self.denominator)
             if torch.isnan(result) or torch.isinf(result):
                 warnings.warn("CRPS: Final computation resulted in NaN or Inf")
                 return torch.tensor(float('nan'))
             return result
         else:
+            warnings.warn(f"CRPS: No valid updates (denominator={self.denominator}, count={self.update_count})")
             return torch.tensor(float('nan'))
 
 
