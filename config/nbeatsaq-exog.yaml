@@ -3,9 +3,9 @@ model:
   nn:
     backbone:
       _target_: modules.NBEATSEXOG
-      num_blocks: 30
+      num_blocks: 10          # Down from 30
+      layer_width: 512        # Down from 1024
       num_layers: 3
-      layer_width: 1024
       share: false
       size_in: 168
       size_out: 24
@@ -34,8 +34,8 @@ model:
 dataset:
   _target_: dataset.datasets.ElectricityWithExogDataModule  # ✓ Fixed
   name: MHLV
-  train_batch_size : 2048 
-  eval_batch_size: 2048
+  train_batch_size: 1024 
+  eval_batch_size: 1024
   num_workers: 4
   persistent_workers: false
   split_boundaries: ['2006-01-01', '2017-12-30', '2018-01-01', '2019-01-01']

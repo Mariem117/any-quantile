@@ -11,6 +11,7 @@ from utils.model_factory import instantiate
 
 from torchmetrics import MeanSquaredError, MeanAbsoluteError
 from metrics import SMAPE, MAPE, CRPS, Coverage
+from losses import MonotonicityLoss
 
 from modules import MLP
     
@@ -255,6 +256,81 @@ class AnyQuantileForecaster(MlpForecaster):
                  prog_bar=False, logger=True, batch_size=batch_size)
         self.log(f"test/coverage-{self.test_coverage.level}", self.test_coverage, on_step=False, on_epoch=True, 
                  prog_bar=False, logger=True, batch_size=batch_size)
+
+
+class AnyQuantileForecasterWithMonotonicity(AnyQuantileForecaster):
+    """Extended forecaster that penalizes quantile crossings."""
+
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        margin = getattr(cfg.model, "monotone_margin", 0.0)
+        self.monotonicity_loss = MonotonicityLoss(margin=margin)
+        self.monotone_weight = getattr(cfg.model, "monotone_weight", 0.0)
+        self.num_train_quantiles = getattr(cfg.model, "num_train_quantiles", 9)
+
+    def _sample_quantiles(self, batch_size: int, device) -> torch.Tensor:
+        num_q = max(1, int(self.num_train_quantiles))
+        if num_q % 2 == 0:
+            num_q += 1  # keep a clear center quantile for metrics
+
+        q_sampling = getattr(self.cfg.model, "q_sampling", "random_in_batch")
+        q_distribution = getattr(self.cfg.model, "q_distribution", "uniform")
+
+        if q_distribution == 'uniform':
+            q = torch.rand(1 if q_sampling == 'fixed_in_batch' else batch_size, num_q, device=device)
+        elif q_distribution == 'beta':
+            beta_param = getattr(self.cfg.model, "q_parameter", 0.3)
+            size = (1 if q_sampling == 'fixed_in_batch' else batch_size, num_q)
+            q = torch.tensor(np.random.beta(beta_param, beta_param, size=size), device=device, dtype=torch.float32)
+        elif q_distribution == 'fixed':
+            q_min = getattr(self.cfg.model, "fixed_q_min", 0.1)
+            q_max = getattr(self.cfg.model, "fixed_q_max", 0.9)
+            q = torch.linspace(q_min, q_max, num_q, device=device)[None]
+        else:
+            assert False, f"Option {q_distribution} is not implemented for model.q_distribution"
+
+        if q_sampling == 'fixed_in_batch':
+            q = q.expand(batch_size, -1)
+
+        q, _ = q.sort(dim=-1)
+        return q
+
+    def training_step(self, batch, batch_idx):
+        batch_size = batch['history'].shape[0]
+        batch['quantiles'] = self._sample_quantiles(batch_size, batch['history'].device)
+
+        net_output = self.shared_forward(batch)
+
+        y_hat = net_output['forecast']  # [B, H, Q]
+        quantiles = net_output['quantiles']  # [B, Q]
+        quantiles_loss = quantiles[:, None]
+
+        pinball_loss = self.loss(y_hat, batch['target'], q=quantiles_loss)
+        monotone_loss = self.monotonicity_loss(y_hat, quantiles_loss)
+        total_loss = pinball_loss + self.monotone_weight * monotone_loss
+
+        center_idx = y_hat.shape[-1] // 2
+
+        self.log("train/pinball_loss", pinball_loss, on_step=True, on_epoch=True,
+                 prog_bar=False, logger=True, batch_size=batch_size)
+        self.log("train/monotone_loss", monotone_loss, on_step=True, on_epoch=True,
+                 prog_bar=False, logger=True, batch_size=batch_size)
+        self.log("train/total_loss", total_loss, on_step=True, on_epoch=True,
+                 prog_bar=True, logger=True, batch_size=batch_size)
+
+        self.train_mse(y_hat[..., center_idx], batch['target'])
+        self.log("train/mse", self.train_mse, on_step=False, on_epoch=True,
+                 prog_bar=True, logger=True, batch_size=batch_size)
+
+        self.train_mae(y_hat[..., center_idx], batch['target'])
+        self.log("train/mae", self.train_mae, on_step=False, on_epoch=True,
+                 prog_bar=False, logger=True, batch_size=batch_size)
+
+        self.train_crps(y_hat, batch['target'], q=quantiles_loss)
+        self.log("train/crps", self.train_crps, on_step=False, on_epoch=True,
+                 prog_bar=False, logger=True, batch_size=batch_size)
+
+        return total_loss
 
 
 class AnyQuantileForecasterLog(AnyQuantileForecaster):

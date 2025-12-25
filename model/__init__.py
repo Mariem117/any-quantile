@@ -1,6 +1,7 @@
 from .models import (
     MlpForecaster, 
     AnyQuantileForecaster, 
+    AnyQuantileForecasterWithMonotonicity,
     AnyQuantileForecasterLog,
     GeneralAnyQuantileForecaster
 )
@@ -14,6 +15,7 @@ except ImportError:
 __all__ = [
     'MlpForecaster',
     'AnyQuantileForecaster', 
+    'AnyQuantileForecasterWithMonotonicity',
     'AnyQuantileForecasterLog',
     'GeneralAnyQuantileForecaster',
     'AnyQuantileForecasterExog'
