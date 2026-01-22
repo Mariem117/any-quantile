@@ -1,0 +1,102 @@
+logging:
+  path: ./lightning_logs/nbeats-attention-improved
+  name: nbeats-aq-attention-seed=${random.seed}
+
+dataset:
+  _target_: dataset.ElectricityUnivariateDataModule
+  name: MHLV
+  num_workers: 8
+  persistent_workers: true
+  train_batch_size: 256 # Smaller batch for attention stability
+  eval_batch_size: 512
+  history_length: 168
+  horizon_length: 48
+  split_boundaries:
+    - "2006-01-01"
+    - "2017-01-01"
+    - "2018-01-01"
+    - "2019-01-01"
+  fillna: ffill
+  train_step: 12
+  eval_step: 24
+
+random:
+  seed: [0] # Single seed first to verify it works
+
+trainer:
+  max_epochs: 20 # Longer training - attention needs more time
+  check_val_every_n_epoch: 1
+  log_every_n_steps: 50
+  devices: 1
+  accelerator: gpu
+  precision: 32 # CRITICAL: fp16 causes NaN with attention!
+  accumulate_grad_batches: 1
+  gradient_clip_val: 0.3 # Lower clipping for attention stability
+
+checkpoint:
+  resume_ckpt: null
+  save_top_k: 3
+  monitor: val/crps
+  mode: min
+
+model:
+  _target_: model.AnyQuantileForecaster
+  input_horizon_len: ${dataset.history_length}
+
+  loss:
+    _target_: losses.MQNLoss
+
+  max_norm: true
+  q_sampling: random_in_batch
+  q_distribution: beta
+  q_parameter: 0.3 # Good tail emphasis
+  metric_space: original
+  metric_clip: 10000
+
+  nn:
+    backbone:
+      _target_: modules.NBEATSAQATTENTION
+
+      # Smaller model to compensate for attention overhead
+      layer_width: 512 # Reduced from 640 (attention adds params)
+      num_layers: 3
+      num_blocks: 16 # Moderate depth
+      share: false
+      size_in: ${dataset.history_length}
+      size_out: ${dataset.horizon_length}
+      dropout: 0.1 # Higher dropout for attention regularization
+
+      # Quantile embedding
+      quantile_embed_dim: 64 # Don't go too large
+      quantile_embed_num: 100
+
+      # Attention configuration - CRITICAL SETTINGS
+      use_attention: true
+      n_heads: 4 # REDUCE from 8 - fewer heads more stable
+      max_len: 200
+
+      attention:
+        d_model: 512 # Match layer_width EXACTLY
+        n_heads: 4 # MUST match n_heads above
+        dropout: 0.15 # Higher dropout in attention
+        d_ff: 1024 # 2× d_model (standard transformer ratio)
+        num_layers: 1 # SINGLE attention layer only!
+        pre_norm: true # Pre-LayerNorm more stable
+
+        # Attention-specific stability settings
+        attention_dropout: 0.1
+        activation_dropout: 0.1
+        use_rotary: false # Keep it simple
+        use_alibi: false
+
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 0.0003 # Lower LR for attention stability
+    weight_decay: 0.0001 # Stronger regularization
+    betas: [0.9, 0.98] # Higher beta2 for attention
+    eps: 1.0e-08 # Default epsilon
+
+  scheduler:
+    _target_: schedulers.InverseSquareRoot
+    warmup_updates: 1000 # LONG warmup critical for attention
+    warmup_end_lr: 0.0003

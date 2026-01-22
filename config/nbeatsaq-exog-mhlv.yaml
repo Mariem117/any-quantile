@@ -1,0 +1,87 @@
+logging:
+  path: lightning_logs
+  name: nbeatsaq-exog-mhlv
+
+dataset:
+  _target_: dataset.ElectricityWithExogDataModule
+  name: MHLV
+  train_batch_size: 128
+  eval_batch_size: 256
+  num_workers: 4
+  persistent_workers: true
+  split_boundaries:
+    - "2006-01-01"
+    - "2017-01-01"
+    - "2018-01-01"
+    - "2019-01-01"
+  history_length: 168
+  horizon_length: 48
+  fillna: ffill
+  train_step: 12
+  eval_step: 24
+  # Exogenous feature configuration
+  exog_features: null # Disable for now - set to ['temperature', 'humidity'] when data is ready
+  calendar_features: true # Only use calendar features
+
+random:
+  seed:
+    - 0
+    - 1
+    - 2
+    - 3
+    - 4
+
+trainer:
+  max_epochs: 15
+  check_val_every_n_epoch: 1
+  log_every_n_steps: 50
+  devices: 1
+  accelerator: gpu
+  precision: 32
+  gradient_clip_val: 0.5
+  accumulate_grad_batches: 1
+  limit_val_batches: 2
+  num_sanity_val_steps: 1
+
+checkpoint:
+  save_top_k: 3
+  monitor: val/crps
+  mode: min
+  ckpt_path: null
+  resume_ckpt: null
+
+model:
+  _target_: model.AnyQuantileForecasterExog
+  nn:
+    backbone:
+      _target_: modules.NBEATSEXOG
+      num_blocks: 12
+      num_layers: 3
+      layer_width: 768
+      share: false
+      size_in: ${dataset.history_length}
+      size_out: ${dataset.horizon_length}
+      dropout: 0.05
+      quantile_embed_dim: 128
+      quantile_embed_num: 100
+      # Exogenous feature dimensions
+      num_continuous: 2 # temperature, humidity
+      num_calendar: 4
+  input_horizon_len: ${dataset.history_length}
+  loss:
+    _target_: losses.MQNLoss
+  q_sampling: random_in_batch
+  q_distribution: beta
+  q_parameter: 0.3
+  max_norm: true
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 0.001
+    weight_decay: 0.0001
+    betas:
+      - 0.9
+      - 0.999
+  scheduler:
+    _target_: schedulers.InverseSquareRoot
+    warmup_updates: 1000
+    warmup_end_lr: 0.001

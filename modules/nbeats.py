@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .attention import QuantileConditionedAttention
+
 
 class NbeatsBlock(torch.nn.Module):
     """Fully connected residual block"""
@@ -54,6 +56,8 @@ class NBEATS(torch.nn.Module):
         super().__init__()
         self.num_layers = num_layers
         self.layer_width = layer_width
+        # Expose width for downstream components that expect a generic width attr
+        self.width = layer_width
         self.size_in = size_in
         self.size_out = size_out
         self.num_blocks = num_blocks
@@ -160,3 +164,80 @@ class NBEATSAQFILM(NBEATS):
             backcast = backcast - b
 
         return output.transpose(-1, -2)
+
+
+class NbeatsBlockWithAttention(NbeatsBlock):
+    """N-BEATS block with enhanced quantile-conditioned attention."""
+
+    def __init__(self, num_layers: int, layer_width: int, size_in: int, size_out: int, 
+                 n_heads: int = 8, dropout: float = 0.1, max_len: int = 1000):
+        super().__init__(num_layers, layer_width, size_in, size_out)
+        self.attention = QuantileConditionedAttention(
+            d_model=layer_width,
+            n_heads=n_heads,
+            dropout=dropout,
+            max_len=max_len,  # Pass max_len for positional encoding
+        )
+
+    def forward(self, x: torch.Tensor, quantile: torch.Tensor) -> tuple:
+        h = x
+        for layer in self.fc_layers:
+            h = F.relu(layer(h))
+
+        h_seq = h.unsqueeze(1)
+        h_attended = self.attention(h_seq, quantile)
+        h = h_attended.squeeze(1)
+
+        return self.forward_projection(h), self.backward_projection(h)
+
+
+class NBEATSAQATTENTION(torch.nn.Module):
+    """N-BEATS with enhanced quantile-conditioned attention."""
+
+    def __init__(self, num_blocks: int, num_layers: int, layer_width: int, 
+                 share: bool, size_in: int, size_out: int, 
+                 n_heads: int = 8, dropout: float = 0.1, max_len: int = 1000):
+        super().__init__()
+
+        self.num_blocks = num_blocks
+        self.share = share
+
+        if share:
+            shared_block = NbeatsBlockWithAttention(
+                num_layers=num_layers,
+                layer_width=layer_width,
+                size_in=size_in,
+                size_out=size_out,
+                n_heads=n_heads,
+                dropout=dropout,
+                max_len=max_len,  # Pass max_len for positional encoding
+            )
+            self.blocks = torch.nn.ModuleList([shared_block] * num_blocks)
+        else:
+            self.blocks = torch.nn.ModuleList([
+                NbeatsBlockWithAttention(
+                    num_layers=num_layers,
+                    layer_width=layer_width,
+                    size_in=size_in,
+                    size_out=size_out,
+                    n_heads=n_heads,
+                    dropout=dropout,
+                    max_len=max_len,  # Pass max_len for positional encoding
+                )
+                for _ in range(num_blocks)
+            ])
+
+    def forward(self, x: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
+        Q = q.shape[-1]
+        B = x.shape[0]
+
+        backcast = x.unsqueeze(1).expand(-1, Q, -1).reshape(B * Q, -1)
+        q_expanded = q.reshape(B * Q, 1)
+
+        output = 0.0
+        for block in self.blocks:
+            f, b = block(backcast, q_expanded)
+            output = output + f
+            backcast = backcast - b
+
+        return output.reshape(B, Q, -1).transpose(1, 2)

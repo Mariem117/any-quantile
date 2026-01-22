@@ -1,22 +1,28 @@
 from .models import (
-    MlpForecaster, 
-    AnyQuantileForecaster, 
+    MlpForecaster,
+    AnyQuantileForecaster,
     AnyQuantileForecasterWithMonotonicity,
-    AnyQuantileForecasterLog,
-    GeneralAnyQuantileForecaster
+    AnyQuantileForecasterHierMonotone,
+    AnyQuantileForecasterAdaptive,
+    AnyQuantileForecasterWithHierarchical,
+    GeneralAnyQuantileForecaster,
+    AnyQuantileWithSeriesEmbedding,
+    AnyQuantileForecasterAdaptiveAttention,
 )
 
-# Import the exogenous version separately
-try:
-    from .models_exog import AnyQuantileForecasterExog
-except ImportError:
-    pass
+from .models_exog import (
+    AnyQuantileForecasterExog,
+)
 
 __all__ = [
     'MlpForecaster',
-    'AnyQuantileForecaster', 
+    'AnyQuantileForecaster',
     'AnyQuantileForecasterWithMonotonicity',
-    'AnyQuantileForecasterLog',
+    'AnyQuantileForecasterHierMonotone',
+    'AnyQuantileForecasterAdaptive',
+    'AnyQuantileForecasterWithHierarchical',
     'GeneralAnyQuantileForecaster',
-    'AnyQuantileForecasterExog'
+    'AnyQuantileWithSeriesEmbedding',
+    'AnyQuantileForecasterAdaptiveAttention',
+    'AnyQuantileForecasterExog',
 ]

@@ -16,6 +16,8 @@ import bisect
 import subprocess
 from glob import glob
 import logging
+import shutil
+import zipfile
 
 import contextlib
 
@@ -148,13 +150,22 @@ class ElectricityUnivariateDataset(Dataset):
             random_quantiles = np.random.rand(100).astype(np.float32)
         test_quantiles = np.concatenate([self.test_quantiles, random_quantiles]).astype(np.float32)
         
+        history = torch.as_tensor(ts[:self.history_length][None], dtype=torch.float32)
+        target = torch.as_tensor(ts[self.history_length:][None], dtype=torch.float32)
+
+        history = torch.nan_to_num(history, nan=0.0, posinf=5000.0, neginf=-5000.0)
+        target = torch.nan_to_num(target, nan=0.0, posinf=5000.0, neginf=-5000.0)
+
+        history = torch.clamp(history, min=-10000.0, max=10000.0)
+        target = torch.clamp(target, min=-10000.0, max=10000.0)
+
         item = {
-            'target': ts[self.history_length:][None],
-            'history': ts[:self.history_length][None],
-            'series_id': np.array([column_idx], dtype=np.int64),
-            'time_features_target': time_features[self.history_length:][None],
-            'time_features_history': time_features[:self.history_length][None],
-            'quantiles': test_quantiles[None],
+            'target': target,
+            'history': history,
+            'series_id': torch.as_tensor([column_idx], dtype=torch.int64),
+            'time_features_target': torch.as_tensor(time_features[self.history_length:][None], dtype=torch.float32),
+            'time_features_history': torch.as_tensor(time_features[:self.history_length][None], dtype=torch.float32),
+            'quantiles': torch.as_tensor(test_quantiles[None], dtype=torch.float32),
         }
         
         return item
@@ -377,15 +388,31 @@ class ElectricityUnivariateDataModule(pl.LightningDataModule):
         logger.info("Downloading datasets")
         datasets_path = "data/electricity/datasets/"
         pathlib.Path(datasets_path).mkdir(parents=True, exist_ok=True)
-        proc = subprocess.run(["gsutil", "-m", "rsync", "gs://electricity-datasets", datasets_path],
-                              capture_output=True)
-        logger.info(proc.stderr.decode())
-        datasets = glob(os.path.join(datasets_path, "*.zip"))
+        existing_dirs = [p for p in glob(os.path.join(datasets_path, "*")) if os.path.isdir(p)]
+        zip_files = glob(os.path.join(datasets_path, "*.zip"))
+
+        if existing_dirs:
+            logger.info("Datasets already present locally, skipping download")
+            return
+
+        if not zip_files:
+            if shutil.which("gsutil") is None:
+                raise FileNotFoundError(
+                    "gsutil not found. Install Google Cloud SDK or place dataset archives in data/electricity/datasets/."
+                )
+            proc = subprocess.run(["gsutil", "-m", "rsync", "gs://electricity-datasets", datasets_path],
+                                  capture_output=True)
+            logger.info(proc.stderr.decode())
+            zip_files = glob(os.path.join(datasets_path, "*.zip"))
 
         logger.info("Unzipping datasets")
-        for d in datasets:
-            proc = subprocess.run(["unzip", "-u", d], capture_output=True)
-            logger.info(proc.stdout.decode())
+        for d in zip_files:
+            try:
+                with zipfile.ZipFile(d) as zf:
+                    zf.extractall(datasets_path)
+                logger.info(f"Extracted {os.path.basename(d)}")
+            except zipfile.BadZipFile:
+                logger.warning(f"Skipping bad zip file: {d}")
 
     def setup(self, stage: str):
         # Assign train/val datasets for use in dataloaders

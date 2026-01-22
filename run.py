@@ -1,4 +1,5 @@
 import argparse
+import os
 import yaml
 import numpy as np
 import pytorch_lightning as pl
@@ -9,6 +10,7 @@ from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 
 from utils.checkpointing import get_checkpoint_path
 from utils.model_factory import instantiate
+from clean_data import analyze_data_quality
 
 
 # NumPy 2.0 compatibility: restore removed aliases
@@ -19,11 +21,8 @@ if not hasattr(np, "unicode_"):
 
 
 def run(cfg_yaml):
-    
     # If config has dotted keys, create from dotlist to get nested structure
     if any('.' in str(k) for k in cfg_yaml.keys()):
-        # Config has flattened keys like 'logging.path'
-        # We need to restructure it into nested dicts
         nested = {}
         for key, value in cfg_yaml.items():
             parts = key.split('.')
@@ -35,63 +34,68 @@ def run(cfg_yaml):
             current[parts[-1]] = value
         cfg = OmegaConf.create(nested)
     else:
-        # Config already has proper nested structure
         cfg = OmegaConf.create(cfg_yaml)
-    
+
     print(f"Config type: {type(cfg)}")
     print(f"Config keys: {list(cfg.keys()) if hasattr(cfg, 'keys') else 'No keys method'}")
     print(OmegaConf.to_yaml(cfg))
-    
-    # Handle logging configuration - use OmegaConf.select for dotted paths
+
     logging_path = OmegaConf.select(cfg, 'logging.path', default='lightning_logs')
-    logging_name = OmegaConf.select(cfg, 'logging.name', default='default')
-    
-    logger = TensorBoardLogger(save_dir=logging_path, version=logging_name, name="")    
-    
-    # Instantiate dataset
+    base_logging_name = OmegaConf.select(cfg, 'logging.name', default='default')
+
     dm = instantiate(cfg.dataset)
     dm.prepare_data()
-    
-    # Setup callbacks
-    lr_monitor = LearningRateMonitor(logging_interval='step')
-    checkpoint_callback = ModelCheckpoint(
-        save_top_k=OmegaConf.select(cfg, 'checkpoint.save_top_k', default=2),
-        monitor="epoch",
-        mode="max",
-        filename="model-{epoch}"
-    )
-    
-    # Set random seed - handle list of seeds or tuples
-    random_seed = OmegaConf.select(cfg, 'random.seed', default=0)
-    if isinstance(random_seed, (list, tuple, ListConfig)):
-        # If it's a ListConfig or list, take first element
-        random_seed = random_seed[0] if len(random_seed) > 0 else 0
-    # Ensure it's an integer
-    random_seed = int(random_seed)
-    pl.seed_everything(random_seed, workers=True)
-    
-    # Create trainer - convert trainer config to dict and override logger
-    # Make sure to resolve=True to handle any interpolations, and None values stay as None
-    trainer_config = OmegaConf.select(cfg, 'trainer', default={})
-    if trainer_config:
-        trainer_kwargs = OmegaConf.to_container(trainer_config, resolve=True)
-    else:
-        trainer_kwargs = {}
-    
-    trainer_kwargs['logger'] = logger
-    trainer_kwargs['callbacks'] = [lr_monitor, checkpoint_callback]
-    
-    trainer = pl.Trainer(**trainer_kwargs)
-    
-    # Instantiate model
-    model = instantiate(OmegaConf.select(cfg, 'model'), cfg=cfg)
-    
-    # Train
-    trainer.fit(model, datamodule=dm, ckpt_path=get_checkpoint_path(cfg))
-    
-    # Test
-    trainer.test(datamodule=dm, ckpt_path=OmegaConf.select(cfg, 'checkpoint.ckpt_path'))
+    dm.setup("fit")
+    try:
+        dm.setup("test")
+    except Exception as e:
+        print(f"Test setup skipped: {e}")
 
+    print("=== TRAIN DATA QUALITY ===")
+    analyze_data_quality(dm.train_dataloader())
+    try:
+        print("=== TEST DATA QUALITY ===")
+        analyze_data_quality(dm.test_dataloader())
+    except Exception as e:
+        print(f"Test data quality check skipped: {e}")
+
+    lr_monitor = LearningRateMonitor(logging_interval='step')
+
+    seeds = OmegaConf.select(cfg, 'random.seed', default=0)
+    if isinstance(seeds, (int, float)):
+        seeds = [int(seeds)]
+    elif isinstance(seeds, (list, tuple, ListConfig)):
+        seeds = [int(s) for s in seeds]
+    else:
+        seeds = [0]
+
+    for seed in seeds:
+        pl.seed_everything(seed, workers=True)
+
+        logging_name = f"{base_logging_name}-seed={seed}" if len(seeds) > 1 else base_logging_name
+        logger = TensorBoardLogger(save_dir=logging_path, version=logging_name, name="")
+
+        checkpoint_callback = ModelCheckpoint(
+            dirpath=os.path.join(logging_path, logging_name, "checkpoints"),
+            save_top_k=OmegaConf.select(cfg, 'checkpoint.save_top_k', default=2),
+            monitor="epoch",
+            mode="max",
+            filename="model-{epoch}"
+        )
+
+        trainer_config = OmegaConf.select(cfg, 'trainer', default={})
+        trainer_kwargs = OmegaConf.to_container(trainer_config, resolve=True) if trainer_config else {}
+        trainer_kwargs['logger'] = logger
+        trainer_kwargs['callbacks'] = [lr_monitor, checkpoint_callback]
+
+        trainer = pl.Trainer(**trainer_kwargs)
+
+        model = instantiate(OmegaConf.select(cfg, 'model'), cfg=cfg)
+
+        trainer.fit(model, datamodule=dm, ckpt_path=get_checkpoint_path(cfg))
+
+        ckpt_path = checkpoint_callback.best_model_path or 'last'
+        trainer.test(datamodule=dm, ckpt_path=ckpt_path)
 
 def main(config_path: str, overrides: list = []):
     

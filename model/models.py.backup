@@ -1,0 +1,408 @@
+import pandas as pd
+import numpy as np
+import pytorch_lightning as pl
+
+import torch.nn as nn
+import torch.nn.functional as F
+import torch
+
+# from hydra.utils import instantiate
+from utils.model_factory import instantiate
+
+from torchmetrics import MeanSquaredError, MeanAbsoluteError
+from metrics import SMAPE, MAPE, CRPS, Coverage
+from losses import MonotonicityLoss
+
+from modules import MLP
+    
+    
+class MlpForecaster(pl.LightningModule):
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.save_hyperparameters()
+        self.backbone = instantiate(cfg.model.nn.backbone)
+        self.init_metrics()
+        self.loss = instantiate(cfg.model.loss)
+        
+    def init_metrics(self):
+        self.train_mse = MeanSquaredError()
+        self.train_mae = MeanAbsoluteError()
+        self.val_mse = MeanSquaredError()
+        self.val_mae = MeanAbsoluteError()
+        self.test_mse = MeanSquaredError()
+        self.test_mae = MeanAbsoluteError()
+        self.train_smape = SMAPE()
+        self.val_smape = SMAPE()
+        self.test_smape = SMAPE()
+        self.val_mape = MAPE()
+        self.test_mape = MAPE()
+        
+    def shared_forward(self, x):
+        history = x['history']
+        if history.dim() == 3 and history.shape[1] == 1:
+            history = history.squeeze(1)
+        history = history[:, -self.cfg.model.input_horizon_len:]
+
+        
+        
+        forecast = self.backbone(history)   
+        return {'forecast': forecast}
+
+    def forward(self, x):
+        out = self.shared_forward(x)
+        return out['forecast']
+
+    def training_step(self, batch, batch_idx):
+        net_output = self.shared_forward(batch)
+        
+        y_hat = net_output['forecast']
+        
+        loss = self.loss(y_hat, batch['target']) 
+        
+        batch_size=batch['history'].shape[0]
+        self.log("train/loss", loss, on_step=True, on_epoch=True, 
+                 prog_bar=True, logger=True, batch_size=batch_size)
+        
+        self.train_mse(y_hat, batch['target'])
+        self.log("train/mse", self.train_mse, on_step=False, on_epoch=True, 
+                 prog_bar=True, logger=True, batch_size=batch_size)
+        
+        self.train_mae(y_hat, batch['target'])
+        self.log("train/mae", self.train_mae, on_step=False, on_epoch=True, 
+                 prog_bar=False, logger=True, batch_size=batch_size)
+        
+        return loss
+    
+    def validation_step(self, batch, batch_idx):
+        net_output = self.shared_forward(batch)
+        
+        y_hat = net_output['forecast']
+        
+        self.val_mse(y_hat, batch['target'])
+        self.val_mae(y_hat, batch['target'])
+        self.val_smape(y_hat, batch['target'])
+                
+        batch_size=batch['history'].shape[0]
+        self.log("val/mse", self.val_mse, on_step=False, on_epoch=True, 
+                 prog_bar=True, logger=True, batch_size=batch_size)
+        self.log("val/mae", self.val_mae, on_step=False, on_epoch=True, 
+                 prog_bar=False, logger=True, batch_size=batch_size)
+        self.log("val/smape", self.val_smape, on_step=False, on_epoch=True, 
+                 prog_bar=False, logger=True, batch_size=batch_size)
+        
+    def test_step(self, batch, batch_idx):
+        net_output = self.shared_forward(batch)
+        
+        y_hat = net_output['forecast']
+        
+        self.test_mse(y_hat, batch['target'])
+        self.test_mae(y_hat, batch['target'])
+        self.test_smape(y_hat, batch['target'])
+        self.test_mape(y_hat, batch['target'])
+                
+        batch_size=batch['history'].shape[0]
+        self.log("test/mse", self.test_mse, on_step=False, on_epoch=True, 
+                 prog_bar=True, logger=True, batch_size=batch_size)
+        self.log("test/mae", self.test_mae, on_step=False, on_epoch=True, 
+                 prog_bar=False, logger=True, batch_size=batch_size)
+        self.log("test/smape", self.test_smape, on_step=False, on_epoch=True, 
+                 prog_bar=False, logger=True, batch_size=batch_size)
+        self.log("test/mape", self.test_mape, on_step=False, on_epoch=True, 
+                 prog_bar=False, logger=True, batch_size=batch_size)
+
+    def configure_optimizers(self):
+        optimizer = instantiate(self.cfg.model.optimizer, self.parameters())
+        scheduler = instantiate(self.cfg.model.scheduler, optimizer)
+        if scheduler is not None:
+            optimizer = {"optimizer": optimizer, 
+                         "lr_scheduler": {"scheduler": scheduler, "interval": "step"}}
+        return optimizer
+    
+    
+class AnyQuantileForecaster(MlpForecaster):
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        
+        self.train_crps = CRPS()
+        self.val_crps = CRPS()
+        self.test_crps = CRPS()
+
+        self.train_coverage = Coverage(level=0.95)
+        self.val_coverage = Coverage(level=0.95)
+        self.test_coverage = Coverage(level=0.95)
+        
+    def shared_forward(self, x):
+        history = x['history']
+        if history.dim() == 3 and history.shape[1] == 1:
+            history = history.squeeze(1)
+        history = history[:, -self.cfg.model.input_horizon_len:]
+        history = torch.nan_to_num(history, nan=0.0, posinf=0.0, neginf=0.0)
+        q_raw = x['quantiles']
+
+        # Sort quantiles to enforce monotone ordering and aligned outputs
+        q_sorted, sort_idx = torch.sort(q_raw, dim=-1)
+
+        x_max = torch.abs(history).max(dim=-1, keepdims=True)[0]
+        x_max = torch.nan_to_num(x_max, nan=1.0, posinf=1.0, neginf=1.0)
+        if self.cfg.model.max_norm:
+            x_max[x_max == 0] = 1
+        else:
+            x_max[x_max >= 0] = 1
+        history = history / x_max
+        
+        forecast = self.backbone(history, q_sorted)
+
+        # Normalize forecast shape to [B, H, Q]
+        if forecast.dim() == 2:
+            forecast = forecast.unsqueeze(-1)
+        if forecast.dim() != 3:
+            raise RuntimeError(f"Unexpected forecast shape {forecast.shape}, expected 3D")
+
+        H_cfg = getattr(self.cfg.dataset, "horizon_length", forecast.shape[1])
+        Q = q_sorted.shape[-1]
+
+        if forecast.shape[1] == Q and forecast.shape[2] != Q:
+            forecast = forecast.transpose(1, 2)
+        if forecast.shape[2] != Q and forecast.shape[1] == Q:
+            forecast = forecast.transpose(1, 2)
+        if forecast.shape[1] != H_cfg and forecast.shape[2] == H_cfg:
+            forecast = forecast.transpose(1, 2)
+
+        if forecast.shape[1] != H_cfg or forecast.shape[2] != Q:
+            raise RuntimeError(f"Forecast shape after normalization {forecast.shape} does not match [B, H={H_cfg}, Q={Q}]")
+
+        # Reorder forecast to match sorted quantiles for every horizon
+        forecast_sorted = torch.gather(forecast, dim=2, index=sort_idx[:, None, :].expand(-1, forecast.shape[1], -1))
+
+        # Apply denormalization and exp transformation
+        forecast_sorted = forecast_sorted * x_max[..., None]
+        forecast_exp = torch.exp(forecast_sorted) - 1
+        
+        # FIXED: Add numerical stability checks
+        forecast_exp = torch.clamp(forecast_exp, min=0, max=1e6)
+        
+        if torch.isnan(forecast_exp).any() or torch.isinf(forecast_exp).any():
+            import warnings
+            warnings.warn(f"WARNING: NaN or Inf in forecast_exp after exp transform!")
+            warnings.warn(f"  forecast (log-space) range: [{forecast_sorted.min():.2f}, {forecast_sorted.max():.2f}]")
+            warnings.warn(f"  x_max range: [{x_max.min():.2f}, {x_max.max():.2f}]")
+            forecast_exp = torch.nan_to_num(forecast_exp, nan=0.0, posinf=1e6, neginf=0.0)
+
+        return {
+            'forecast': forecast_sorted, 
+            'forecast_exp': forecast_exp, 
+            'quantiles': q_sorted
+        }
+
+    def forward(self, x):
+        out = self.shared_forward(x)
+        return out['forecast_exp']
+    
+    def training_step(self, batch, batch_idx):
+        batch_size = batch['history'].shape[0]
+        
+        # Sample quantiles
+        if self.cfg.model.q_sampling == 'deterministic':
+            if self.cfg.model.q_distribution == 'uniform':
+                batch['quantiles'] = torch.linspace(0, 1, batch_size + 2)[1:-1, None].to(batch['history'])
+            else:
+                raise NotImplementedError(f"q_distribution={self.cfg.model.q_distribution} not implemented for deterministic sampling")
+        elif self.cfg.model.q_sampling == 'random':
+            batch['quantiles'] = torch.rand(batch_size, 1).to(batch['history'])
+            batch['quantiles'] = batch['quantiles'].sort(dim=0)[0]
+        elif self.cfg.model.q_sampling == 'random_in_batch':
+            batch['quantiles'] = torch.rand(batch_size, 1).to(batch['history'])
+        else:
+            assert False, f"Option {self.cfg.model.q_sampling} is not implemented for model.q_sampling"
+        
+        net_output = self.shared_forward(batch)
+        
+        y_hat = net_output['forecast']  # BxHxQ
+        if y_hat.dim() == 3 and y_hat.shape[1] != batch['target'].shape[1] and y_hat.shape[2] == batch['target'].shape[1]:
+            y_hat = y_hat.transpose(1, 2)
+        quantiles = net_output['quantiles'][:,None] # Bx1xQ
+        y_hat_exp = net_output['forecast_exp'] # BxHxQ
+        
+        loss = self.loss(y_hat, torch.log(batch['target'] + 1), q=quantiles) 
+        
+        batch_size=batch['history'].shape[0]
+        self.log("train/loss", loss, on_step=True, on_epoch=True, 
+                 prog_bar=True, logger=True, batch_size=batch_size)
+        
+        self.train_mse(y_hat_exp[..., 0], batch['target'])
+        self.log("train/mse", self.train_mse, on_step=False, on_epoch=True, 
+                 prog_bar=True, logger=True, batch_size=batch_size)
+        
+        self.train_mae(y_hat_exp[..., 0], batch['target'])
+        self.log("train/mae", self.train_mae, on_step=False, on_epoch=True, 
+                 prog_bar=False, logger=True, batch_size=batch_size)
+        
+        self.train_crps(y_hat_exp, batch['target'], q=quantiles)
+        self.log("train/crps", self.train_crps, on_step=False, on_epoch=True, 
+                 prog_bar=False, logger=True, batch_size=batch_size)
+        
+        return loss
+    
+    def validation_step(self, batch, batch_idx):
+        batch['quantiles'] = self.val_coverage.add_evaluation_quantiles(batch['quantiles'])
+        net_output = self.shared_forward(batch)
+        
+        y_hat = net_output['forecast']  # BxHxQ
+        if y_hat.dim() == 3 and y_hat.shape[1] != batch['target'].shape[1] and y_hat.shape[2] == batch['target'].shape[1]:
+            y_hat = y_hat.transpose(1, 2)
+        quantiles = net_output['quantiles'][:,None] # Bx1xQ
+        y_hat_exp = net_output['forecast_exp'] # BxHxQ
+        
+        self.val_mse(y_hat_exp[..., 0], batch['target'])
+        self.val_mae(y_hat_exp[..., 0], batch['target'])
+        self.val_smape(y_hat_exp[..., 0], batch['target'])
+        self.val_crps(y_hat_exp, batch['target'], q=quantiles)
+        self.val_coverage(y_hat_exp, batch['target'], q=quantiles)
+                
+        batch_size=batch['history'].shape[0]
+        self.log("val/mse", self.val_mse, on_step=False, on_epoch=True, 
+                 prog_bar=True, logger=True, batch_size=batch_size)
+        self.log("val/mae", self.val_mae, on_step=False, on_epoch=True, 
+                 prog_bar=False, logger=True, batch_size=batch_size)
+        self.log("val/smape", self.val_smape, on_step=False, on_epoch=True, 
+                 prog_bar=False, logger=True, batch_size=batch_size)
+        self.log("val/crps", self.val_crps, on_step=False, on_epoch=True, 
+                 prog_bar=False, logger=True, batch_size=batch_size)
+        self.log(f"val/coverage-{self.val_coverage.level}", self.val_coverage, on_step=False, on_epoch=True, 
+                 prog_bar=False, logger=True, batch_size=batch_size)
+        
+    def test_step(self, batch, batch_idx):
+        batch['quantiles'] = self.test_coverage.add_evaluation_quantiles(batch['quantiles'])
+        net_output = self.shared_forward(batch)
+        
+        y_hat = net_output['forecast']  # BxHxQ
+        if y_hat.dim() == 3 and y_hat.shape[1] != batch['target'].shape[1] and y_hat.shape[2] == batch['target'].shape[1]:
+            y_hat = y_hat.transpose(1, 2)
+        quantiles = net_output['quantiles'][:,None] # Bx1xQ
+        y_hat_exp = net_output['forecast_exp'] # BxHxQ
+        
+        # FIXED: Find the actual median quantile (0.5) index instead of assuming index 0
+        # quantiles is shape [B, 1, Q], so take first batch item
+        q_values = quantiles[0, 0, :].cpu()  # [Q]
+        median_idx = (q_values - 0.5).abs().argmin().item()
+        
+        # Verify we found something close to median
+        median_q_value = q_values[median_idx].item()
+        if abs(median_q_value - 0.5) > 0.1:
+            # If no median quantile, use middle quantile as fallback
+            median_idx = quantiles.shape[-1] // 2
+            import warnings
+            warnings.warn(f"No median quantile found (closest was {median_q_value:.3f}), "
+                         f"using middle index {median_idx} (q={q_values[median_idx]:.3f})")
+        
+        # FIXED: Add diagnostic logging on first batch
+        if batch_idx == 0:
+            import warnings
+            warnings.warn(f"Test batch diagnostics:")
+            warnings.warn(f"  Quantiles: {q_values.numpy()}")
+            warnings.warn(f"  Selected median idx: {median_idx} (q={median_q_value:.3f})")
+            warnings.warn(f"  Predictions shape: {y_hat_exp.shape}")
+            warnings.warn(f"  Predictions range: [{y_hat_exp.min():.2f}, {y_hat_exp.max():.2f}]")
+            warnings.warn(f"  Target range: [{batch['target'].min():.2f}, {batch['target'].max():.2f}]")
+        
+        y_hat_point = y_hat_exp[..., median_idx].contiguous()
+        
+        self.test_mse(y_hat_point, batch['target'])
+        self.test_mae(y_hat_point, batch['target'])
+        self.test_smape(y_hat_point, batch['target'])
+        self.test_mape(y_hat_point, batch['target'])
+        self.test_crps(y_hat_exp, batch['target'], q=quantiles)
+        self.test_coverage(y_hat_exp, batch['target'], q=quantiles)
+                
+        batch_size=batch['history'].shape[0]
+        self.log("test/mse", self.test_mse, on_step=False, on_epoch=True, 
+                 prog_bar=True, logger=True, batch_size=batch_size)
+        self.log("test/mae", self.test_mae, on_step=False, on_epoch=True, 
+                 prog_bar=False, logger=True, batch_size=batch_size)
+        self.log("test/smape", self.test_smape, on_step=False, on_epoch=True, 
+                 prog_bar=False, logger=True, batch_size=batch_size)
+        self.log("test/mape", self.test_mape, on_step=False, on_epoch=True, 
+                 prog_bar=False, logger=True, batch_size=batch_size)
+        self.log("test/crps", self.test_crps, on_step=False, on_epoch=True, 
+                 prog_bar=False, logger=True, batch_size=batch_size)
+        self.log(f"test/coverage-{self.test_coverage.level}", self.test_coverage, on_step=False, on_epoch=True, 
+                 prog_bar=False, logger=True, batch_size=batch_size)
+        
+
+class ExogenousAnyQuantileForecaster(AnyQuantileForecaster):
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        
+    def shared_forward(self, x):
+        history = x['history'][:, -self.cfg.model.input_horizon_len:]
+        q = x['quantiles']
+
+        x_max = torch.abs(history).max(dim=-1, keepdims=True)[0]
+        if self.cfg.model.max_norm:
+            x_max[x_max == 0] = 1
+        else:
+            x_max[x_max >= 0] = 1
+        history = history / x_max
+        
+        # Extract exogenous features
+        continuous = None
+        calendar = None
+        
+        if 'exog_history' in x:
+            continuous = x['exog_history'].squeeze(1)  # [B, T, num_continuous]
+        
+        if 'calendar_history' in x:
+            calendar = x['calendar_history'].squeeze(1)  # [B, T, 4]
+            # Convert normalized [0,1] features to integer indices
+            # Be careful with boundary conditions
+            calendar_indices = torch.stack([
+                torch.clamp((calendar[..., 0] * 24).long(), 0, 23),  # hour: 0-23
+                torch.clamp((calendar[..., 1] * 7).long(), 0, 6),    # dow: 0-6
+                torch.clamp((calendar[..., 2] * 12).long(), 0, 11),  # month: 0-11
+                calendar[..., 3].long()  # weekend: already 0 or 1
+            ], dim=-1)
+            calendar = calendar_indices
+        
+        # Pass to backbone
+        forecast = self.backbone(history, q, continuous, calendar)
+        return {'forecast': forecast * x_max[..., None], 'quantiles': q}
+
+    def forward(self, x):
+        out = self.shared_forward(x)
+        return out['forecast']
+
+
+class GeneralAnyQuantileForecaster(AnyQuantileForecaster):
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        
+        self.time_series_projection_in = torch.nn.Linear(1, cfg.model.nn.backbone.d_model)
+        self.time_series_projection_out = torch.nn.Linear(cfg.model.nn.backbone.d_model, 1)
+        
+        # 100 includes 31 days, 12 months and 7 days of week
+        self.time_embedding = torch.nn.Embedding(2000, cfg.model.nn.embedding_dim)
+        # this includes 0 as no deal and deal types 1,2,3
+        self.time_series_id = torch.nn.Embedding(cfg.model.nn.time_series_id_num, cfg.model.nn.embedding_dim)
+        
+    def shared_forward(self, x):
+        history = x['history'][:, -self.cfg.model.input_horizon_len:]
+        
+        t_h = torch.arange(self.cfg.model.input_horizon_len, dtype=torch.int64)[None].to(history.device)
+        t_t = torch.arange(x['time_features_target'].shape[1], dtype=torch.int64)[None].to(history.device) + self.cfg.model.input_horizon_len
+        
+        time_features_tgt = torch.repeat_interleave(self.time_embedding(t_t), repeats=history.shape[0], dim=0)
+        time_features_src = self.time_embedding(t_h)
+        
+        xf_input = time_features_tgt
+        xt_input = time_features_src + self.time_series_projection_in(history.unsqueeze(-1))
+        xs_input = 0.0 * self.time_series_id(x['series_id'])
+        
+        backbone_output = self.backbone(xt_input=xt_input, xf_input=xf_input, xs_input=xs_input)   
+        backbone_output = self.time_series_projection_out(backbone_output)
+        forecast = backbone_output[..., 0] + history.mean(dim=-1, keepdims=True) + self.shortcut(history)
+        return {'forecast': forecast}
+
+    def forward(self, x):
+        out = self.shared_forward(x)
+        return out['forecast']

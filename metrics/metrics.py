@@ -31,36 +31,64 @@ class Coverage(Metric):
         return torch.cat([quantiles, quantiles_metric], dim=-1)
 
     def update(self, preds: torch.Tensor, target: torch.Tensor, q: torch.Tensor) -> None:
-        """ Compute multi-quantile loss function
+        """ Compute coverage metric for prediction intervals
 
         :param preds: Bx..xQ tensor of predicted values, Q is the number of quantiles
         :param target: Bx..x1, or Bx.. tensor of target values
         :param q: Bx..xQ tensor of quantiles telling which quantiles input predictions correspond to
         :return: value if multi-quantile loss function
         """
-        # Check for NaN/Inf in inputs
-        if torch.isnan(preds).any() or torch.isinf(preds).any():
-            warnings.warn("Coverage: NaN or Inf detected in predictions, skipping update")
-            return
-        if torch.isnan(target).any() or torch.isinf(target).any():
-            warnings.warn("Coverage: NaN or Inf detected in targets, skipping update")
-            return
-
         if target.dim() != preds.dim():
             target = target[..., None]
 
-        num_high = (q==self.level_high).sum(dim=-1, keepdims=True)
-        num_low = (q==self.level_low).sum(dim=-1, keepdims=True)
-        
-        # Add epsilon to avoid division by zero
-        num_high = torch.clamp(num_high, min=1.0)
-        num_low = torch.clamp(num_low, min=1.0)
-        
-        preds_high = (preds * (q==self.level_high)).sum(dim=-1, keepdims=True) / num_high
-        preds_low = (preds * (q==self.level_low)).sum(dim=-1, keepdims=True) / num_low
+        # Robustly find the nearest quantile indices for the desired coverage levels
+        # q may be shaped BxQ, Bx1xQ or BxHxQ. Normalize to BxQ for index selection
+        q_sel = q
+        if q_sel.dim() == 3 and q_sel.shape[1] == 1:
+            # Bx1xQ -> BxQ
+            q_sel = q_sel[:, 0, :]
+        elif q_sel.dim() == 3 and q_sel.shape[1] > 1:
+            # BxHxQ -> use the first horizon's quantiles (assume same across horizons)
+            q_sel = q_sel[:, 0, :]
 
-        self.numerator += ((target < preds_high) * (target >= preds_low)).sum()
-        self.denominator += torch.numel(target)
+        # Compute nearest indices for high and low levels
+        # q_sel: BxQ
+        with torch.no_grad():
+            diff_high = torch.abs(q_sel - self.level_high)
+            diff_low = torch.abs(q_sel - self.level_low)
+            idx_high = torch.argmin(diff_high, dim=-1)  # shape: (B,)
+            idx_low = torch.argmin(diff_low, dim=-1)
+
+        # Build gather indices to select predictions at those quantile positions
+        # preds shape: B x ... x Q
+        B = preds.shape[0]
+        spatial_shape = preds.shape[1:-1]  # can be () or (H,)
+        # Create gather index shape: [B] + [1]*len(spatial_shape) + [1]
+        gather_shape = [B] + [1] * len(spatial_shape) + [1]
+        idx_high_g = idx_high.view(*gather_shape).expand(*([B] + list(spatial_shape) + [1])).to(preds.device)
+        idx_low_g = idx_low.view(*gather_shape).expand(*([B] + list(spatial_shape) + [1])).to(preds.device)
+
+        preds_high = preds.gather(-1, idx_high_g)
+        preds_low = preds.gather(-1, idx_low_g)
+
+        # Now compute coverage: target must match preds spatial dims. Ensure target has same rank
+        if target.dim() != preds_high.dim():
+            target = target[..., None]
+
+        # Use min/max to handle non-monotonic quantiles (low might be > high)
+        preds_upper = torch.maximum(preds_high, preds_low)
+        preds_lower = torch.minimum(preds_high, preds_low)
+        
+        # Filter out NaN/Inf values - only count valid entries
+        valid_mask = ~(torch.isnan(preds_upper) | torch.isinf(preds_upper) | 
+                       torch.isnan(preds_lower) | torch.isinf(preds_lower) |
+                       torch.isnan(target) | torch.isinf(target))
+        
+        if valid_mask.any():
+            # Coverage: target is in interval [lower, upper)
+            in_interval = (target >= preds_lower) & (target <= preds_upper)
+            self.numerator += (in_interval & valid_mask).sum()
+            self.denominator += valid_mask.sum()
 
     def compute(self):
         if self.denominator > 0:

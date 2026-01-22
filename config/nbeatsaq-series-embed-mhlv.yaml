@@ -1,0 +1,96 @@
+# FIXED Series Embedding Config
+# This config won't work well because:
+# 1. Your dataset doesn't provide series_id (it's univariate MHLV, not multivariate)
+# 2. Series embeddings are designed for multi-series forecasting
+#
+# BUT if you still want to test it, here are the fixes:
+
+logging:
+  path: "./lightning_logs/${dataset.name}"
+  name: "nbeatsaq-series-embed-seed=${random.seed}"
+
+dataset:
+  _target_: dataset.ElectricityUnivariateDataModule
+  name: "MHLV"
+  num_workers: 8 # Increased from 4
+  persistent_workers: true
+  train_batch_size: 256 # CRITICAL: Changed from 512
+  eval_batch_size: 512
+  history_length: 168
+  horizon_length: 48
+  split_boundaries:
+    - "2006-01-01"
+    - "2017-01-01"
+    - "2018-01-01"
+    - "2019-01-01"
+  fillna: "ffill"
+  train_step: 12 # CRITICAL: Changed from 1!
+  eval_step: 24
+
+random:
+  seed: [0] # Start with 1 seed to test
+
+trainer:
+  max_epochs: 20 # Increased from 15
+  check_val_every_n_epoch: 1
+  log_every_n_steps: 50 # Changed from 100
+  devices: 1
+  accelerator: "gpu"
+  precision: 32
+  gradient_clip_val: 0.5
+
+checkpoint:
+  resume_ckpt: null
+  save_top_k: 3
+  monitor: "val/crps" # CRITICAL: Added monitoring!
+  mode: "min"
+
+# MODEL WITH SERIES EMBEDDINGS
+model:
+  _target_: model.AnyQuantileWithSeriesEmbedding
+  input_horizon_len: "${dataset.history_length}"
+
+  # Series embedding parameters
+  # NOTE: These won't be used because MHLV dataset doesn't provide series_id!
+  num_series: 1 # Changed from 35 (MHLV is single series)
+  series_embed_dim: 32
+
+  # Loss and training
+  loss:
+    _target_: losses.MQNLoss
+  max_norm: true
+  q_sampling: "random_in_batch"
+  q_distribution: "beta" # CRITICAL: Changed from uniform!
+  q_parameter: 0.3 # Added for beta distribution
+
+  # Backbone architecture
+  nn:
+    backbone:
+      _target_: modules.NBEATSAQCAT # CRITICAL: Changed from NBEATSAQATTENTION!
+      num_blocks: 24 # Increased from 15
+      num_layers: 4 # Increased from 3
+      layer_width: 1024 # Increased from 512
+      share: false
+      size_in: "${dataset.history_length}"
+      size_out: "${dataset.horizon_length}"
+      dropout: 0.05 # Changed from 0.1
+      quantile_embed_dim: 128 # Added (was missing)
+      quantile_embed_num: 100 # Added (was missing)
+
+  # Optimizer and scheduler
+  optimizer:
+    _target_: torch.optim.AdamW # CRITICAL: Changed from Adam!
+    lr: 0.001 # Increased from 0.0001
+    weight_decay: 0.0001 # Added
+    betas: [0.9, 0.999]
+
+  scheduler:
+    _target_: schedulers.InverseSquareRoot
+    warmup_updates: 1000 # Increased from 400
+    warmup_end_lr: 0.001 # Match lr
+
+
+# WARNING: This config will likely perform worse than base model because:
+# - Series embeddings add overhead without benefit (only 1 series)
+# - The embedding will just add noise to the input
+# - Expected CRPS: ~60-70 (worse than base 56.71)

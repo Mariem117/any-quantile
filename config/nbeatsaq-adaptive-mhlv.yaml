@@ -1,0 +1,84 @@
+logging:
+  path: lightning_logs
+  name: nbeatsaq-improved-mhlv
+
+dataset:
+  _target_: dataset.ElectricityUnivariateDataModule
+  name: MHLV
+  train_batch_size: 256 # Larger batch for better gradient estimates
+  eval_batch_size: 512
+  num_workers: 4
+  persistent_workers: true
+  split_boundaries:
+    - "2006-01-01"
+    - "2017-01-01"
+    - "2018-01-01"
+    - "2019-01-01"
+  history_length: 168
+  horizon_length: 48
+  fillna: "ffill"
+  train_step: 12
+  eval_step: 24
+
+random:
+  seed: [0, 1, 2, 3, 4, 5, 6, 7]
+
+trainer:
+  max_epochs: 15 # CRITICAL: Train longer for convergence
+  check_val_every_n_epoch: 1
+  log_every_n_steps: 50
+  devices: 1
+  accelerator: gpu
+  precision: 32
+  gradient_clip_val: 0.5 # Lower clipping for stability
+  accumulate_grad_batches: 1 # Remove accumulation, use larger batch instead
+
+checkpoint:
+  save_top_k: 3
+  monitor: val/crps # Monitor CRPS instead of loss
+  mode: min
+  ckpt_path: null
+  resume_ckpt: null
+
+model:
+  _target_: model.AnyQuantileForecasterAdaptive # Use adaptive WITHOUT attention overhead
+
+  nn:
+    backbone:
+      _target_: modules.NBEATSAQCAT
+      num_blocks: 24 # Increase capacity
+      num_layers: 4 # Deeper blocks
+      layer_width: 1024 # Wider layers
+      share: false
+      size_in: ${dataset.history_length}
+      size_out: ${dataset.horizon_length}
+      dropout: 0.05 # Reduce dropout - you might be under-fitting
+      quantile_embed_dim: 128 # Larger quantile embedding
+      quantile_embed_num: 100
+
+  input_horizon_len: ${dataset.history_length}
+  loss:
+    _target_: losses.MQNLoss
+  q_sampling: random_in_batch
+  q_distribution: beta # Beta distribution focuses on extremes
+  q_parameter: 0.3 # Lower = more focus on tails (0.025, 0.975)
+  max_norm: true
+
+  # Adaptive sampling parameters - tuned for better tail coverage
+  adaptive_sampling:
+    num_adaptive_quantiles: 5 # More adaptive quantiles
+    num_bins: 200 # Finer granularity
+    momentum: 0.95 # Faster adaptation to recent losses
+    temperature: 0.8 # Sharper sampling focus
+    min_prob: 0.0005 # Allow more aggressive focusing
+
+  optimizer:
+    _target_: torch.optim.AdamW # Use AdamW for better regularization
+    lr: 0.001 # Higher initial LR
+    weight_decay: 0.0001 # Stronger weight decay
+    betas: [0.9, 0.999]
+
+  scheduler:
+    _target_: schedulers.InverseSquareRoot
+    warmup_updates: 1000 # Longer warmup for stability
+    warmup_end_lr: 0.001
